@@ -72,13 +72,18 @@ Write-Host $marker
 $verified = $false
 try {
     if ($addedTrust) {
-        $marker = '{0} BEFORE Import-Certificate' -f [DateTime]::UtcNow.ToString('o')
+        $marker = '{0} BEFORE certutil -user -addstore Root pipeline' -f [DateTime]::UtcNow.ToString('o')
         [IO.File]::AppendAllText($diagnosticPath, "$marker`n")
         Write-Host $marker
-        Import-Certificate -FilePath $certificatePath -CertStoreLocation 'Cert:\CurrentUser\Root' | Out-Null
-        $marker = '{0} AFTER Import-Certificate' -f [DateTime]::UtcNow.ToString('o')
+        & "$env:SystemRoot\System32\certutil.exe" -user -addstore Root $certificatePath 2>&1 |
+            Tee-Object -FilePath (Join-Path $EvidenceDirectory 'certificate-import.certutil.txt')
+        $importExitCode = $LASTEXITCODE
+        $marker = '{0} AFTER certutil -user -addstore Root pipeline exit={1}' -f [DateTime]::UtcNow.ToString('o'), $importExitCode
         [IO.File]::AppendAllText($diagnosticPath, "$marker`n")
         Write-Host $marker
+        if ($importExitCode -ne 0) {
+            throw "certutil CurrentUser/Root import failed with exit code $importExitCode."
+        }
     }
     foreach ($record in $records) {
         $path = Join-Path $ArtifactDirectory $record.artifact_path
