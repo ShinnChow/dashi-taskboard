@@ -60,23 +60,30 @@ foreach ($name in $names) {
 # it is NOT proof that the PE signature or file digest is valid.
 $certificatePath = Join-Path $EvidenceDirectory 'test-signer.cer'
 [IO.File]::WriteAllBytes($certificatePath, $testCertificate.RawData)
-$storePath = "Cert:\CurrentUser\Root\$($testCertificate.Thumbprint)"
+$storePath = "Cert:\LocalMachine\Root\$($testCertificate.Thumbprint)"
 $addedTrust = -not (Test-Path -LiteralPath $storePath)
+Write-Host ('{0} TRUST store={1} addedTrust={2}' -f [DateTime]::UtcNow.ToString('o'), $storePath, $addedTrust)
 $verified = $false
 try {
     if ($addedTrust) {
-        Import-Certificate -FilePath $certificatePath -CertStoreLocation 'Cert:\CurrentUser\Root' | Out-Null
+        Write-Host ('{0} BEFORE Import-Certificate LocalMachine/Root' -f [DateTime]::UtcNow.ToString('o'))
+        Import-Certificate -FilePath $certificatePath -CertStoreLocation 'Cert:\LocalMachine\Root' | Out-Null
+        Write-Host ('{0} AFTER Import-Certificate LocalMachine/Root' -f [DateTime]::UtcNow.ToString('o'))
     }
     foreach ($record in $records) {
         $path = Join-Path $ArtifactDirectory $record.artifact_path
         # /pa checks Authenticode rather than driver policy; no /a catalog fallback.
         # /all checks every embedded signature. Any nonzero exit, even a warning, fails.
+        Write-Host ('{0} BEFORE SignTool file={1}' -f [DateTime]::UtcNow.ToString('o'), $record.artifact_path)
         & $signTool.FullName verify /pa /all /v $path 2>&1 |
             Tee-Object -FilePath (Join-Path $EvidenceDirectory "$($record.artifact_path).signtool.txt")
         $record.signtool_exit_code = $LASTEXITCODE
+        Write-Host ('{0} AFTER SignTool file={1} exit={2}' -f [DateTime]::UtcNow.ToString('o'), $record.artifact_path, $record.signtool_exit_code)
         if ($LASTEXITCODE -ne 0) { throw "SignTool integrity/policy verification failed for $($record.artifact_path)." }
+        Write-Host ('{0} BEFORE Get-AuthenticodeSignature file={1}' -f [DateTime]::UtcNow.ToString('o'), $record.artifact_path)
         $signature = Get-AuthenticodeSignature -LiteralPath $path
         $record.status_after_temporary_trust = [string]$signature.Status
+        Write-Host ('{0} AFTER Get-AuthenticodeSignature file={1} status={2}' -f [DateTime]::UtcNow.ToString('o'), $record.artifact_path, $record.status_after_temporary_trust)
         if ($signature.Status -ne 'Valid' -or $signature.SignatureType -ne 'Authenticode' -or
             $null -eq $signature.SignerCertificate -or
             $signature.SignerCertificate.GetCertHashString([Security.Cryptography.HashAlgorithmName]::SHA256) -ne $ExpectedSignerSha256) {
@@ -86,13 +93,15 @@ try {
     $verified = $true
 }
 finally {
+    Write-Host ('{0} BEFORE cleanup store={1} addedTrust={2}' -f [DateTime]::UtcNow.ToString('o'), $storePath, $addedTrust)
     if ($addedTrust -and (Test-Path -LiteralPath $storePath)) {
-        Remove-Item -LiteralPath $storePath -Force
+        Remove-Item -LiteralPath $storePath
     }
+    Write-Host ('{0} AFTER cleanup store={1}' -f [DateTime]::UtcNow.ToString('o'), $storePath)
     [ordered]@{
         verified = $verified
         expected_signer_sha256 = $ExpectedSignerSha256.ToUpperInvariant()
-        trust_scope = 'Disposable GitHub-hosted runner CurrentUser/Root only; not public trust.'
+        trust_scope = 'Disposable GitHub-hosted runner LocalMachine/Root only; not public trust.'
         temporary_trust_removed = $addedTrust -and -not (Test-Path -LiteralPath $storePath)
         files = $records
     } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'verification.json') -Encoding utf8
