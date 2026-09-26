@@ -56,6 +56,7 @@ function fixtureHtml(origin) {
     <meta charset="utf-8">
     <style>
       html, body { width: 1200px; height: 800px; margin: 0; }
+      nav[data-app-navigation-rail] { position: absolute; }
       aside { position: absolute; width: 200px; height: 800px; }
       main { position: absolute; left: 200px; width: 1000px; height: 700px; }
       main > header { position: absolute; z-index: 2; width: 1000px; height: 48px; }
@@ -66,14 +67,14 @@ function fixtureHtml(origin) {
     </style>
   </head>
   <body>
+    <nav data-app-navigation-rail>
+      <button data-sidebar-destination="home"><span class="sr-only">首页</span></button>
+      <button data-sidebar-destination="sites"><span class="sr-only">站点</span></button>
+      <button aria-haspopup="menu"><svg></svg><span class="sr-only">探索</span></button>
+    </nav>
     <aside>
       <nav role="navigation">
         <div data-app-action-sidebar-scroll>
-          <div>
-            <button><span>首页</span></button>
-            <button><span>站点</span></button>
-            <button><svg></svg><span class="text-fade-truncate">插件</span></button>
-          </div>
           <section data-app-action-sidebar-section>
             <div data-app-action-sidebar-section-heading="项目">项目</div>
           </section>
@@ -175,7 +176,7 @@ function fixtureHtml(origin) {
         window.__browserPanelClosed = true;
       });
     </script>
-    <script>eval(atob(${JSON.stringify(encodedSource)}));</script>
+    <script>eval(new TextDecoder().decode(Uint8Array.from(atob(${JSON.stringify(encodedSource)}), (byte) => byte.charCodeAt(0))));</script>
     <script>
       (async () => {
         const publishHeartbeat = () => window.postMessage({
