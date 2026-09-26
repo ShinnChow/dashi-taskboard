@@ -74,6 +74,8 @@ try {
     if ($addedTrust) {
         Add-Type -TypeDefinition @'
 using System;
+using System.Diagnostics;
+using System.IO;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography.X509Certificates;
 
@@ -103,6 +105,9 @@ public static class Local182CryptUI
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool CertCloseStore(IntPtr store, uint flags);
 
+    [DllImport("kernel32.dll", ExactSpelling = true)]
+    private static extern uint GetCurrentThreadId();
+
     // Capture each cached Win32 error before returning to PowerShell.
     public static IntPtr OpenRoot(out int error)
     {
@@ -112,7 +117,7 @@ public static class Local182CryptUI
         return store;
     }
 
-    public static bool ImportCertificate(IntPtr store, X509Certificate2 certificate, out int error)
+    public static bool ImportCertificate(IntPtr store, X509Certificate2 certificate, string boundaryPath, out int error)
     {
         var source = new CRYPTUI_WIZ_IMPORT_SRC_INFO {
             dwSize = (uint)Marshal.SizeOf<CRYPTUI_WIZ_IMPORT_SRC_INFO>(),
@@ -122,9 +127,23 @@ public static class Local182CryptUI
             pwszPassword = string.Empty
         };
         try {
+            string identity;
+            using (var process = Process.GetCurrentProcess()) {
+                DateTime created = process.StartTime.ToUniversalTime();
+                identity = FormattableString.Invariant(
+                    $"\"pid\":{process.Id},\"process_start_utc\":\"{created:o}\",\"process_start_utc_ticks\":{created.Ticks}");
+            }
+            uint nativeTid = GetCurrentThreadId();
+            DateTime entered = DateTime.UtcNow;
+            // Source preparation is complete; the next operation after this write is the P/Invoke.
+            File.AppendAllText(boundaryPath, FormattableString.Invariant(
+                $"{{\"phase\":\"NATIVE_ENTER\",\"utc\":\"{entered:o}\",\"utc_ticks\":{entered.Ticks},{identity},\"native_tid\":{nativeTid}}}\n"));
             // CRYPTUI_WIZ_NO_UI | CRYPTUI_WIZ_IMPORT_ALLOW_CERT.
             bool imported = CryptUIWizImport(0x00020001, IntPtr.Zero, null, ref source, store);
             error = Marshal.GetLastWin32Error();
+            DateTime returned = DateTime.UtcNow;
+            File.AppendAllText(boundaryPath, FormattableString.Invariant(
+                $"{{\"phase\":\"NATIVE_RETURN\",\"utc\":\"{returned:o}\",\"utc_ticks\":{returned.Ticks},{identity},\"native_tid\":{GetCurrentThreadId()},\"success\":{(imported ? "true" : "false")},\"win32\":{error}}}\n"));
             return imported;
         }
         finally {
@@ -140,6 +159,40 @@ public static class Local182CryptUI
     }
 }
 '@
+        $nativeBoundaryPath = Join-Path $EvidenceDirectory 'cryptui-native-boundary.jsonl'
+        $observerReadyPath = Join-Path $EvidenceDirectory 'cryptui-observer.ready'
+        $observer = $null
+        try {
+            $self = [Diagnostics.Process]::GetCurrentProcess()
+            try { $createdTicks = $self.StartTime.ToUniversalTime().Ticks }
+            finally { $self.Dispose() }
+            $startInfo = [Diagnostics.ProcessStartInfo]::new((Join-Path $PSHOME 'pwsh.exe'))
+            $startInfo.UseShellExecute = $false
+            foreach ($argument in @('-NoLogo', '-NoProfile', '-NonInteractive', '-File',
+                (Join-Path $PSScriptRoot 'observe-signpath-cryptui.ps1'),
+                '-TargetProcessId', [string]$PID, '-TargetStartTicks', [string]$createdTicks,
+                '-EvidenceDirectory', $EvidenceDirectory)) {
+                $startInfo.ArgumentList.Add($argument)
+            }
+            $observer = [Diagnostics.Process]::Start($startInfo)
+            # Only bound observer startup, not import/verification runtime; never kill the target.
+            $startup = [Diagnostics.Stopwatch]::StartNew()
+            while (-not [IO.File]::Exists($observerReadyPath) -and -not $observer.HasExited -and
+                $startup.Elapsed.TotalSeconds -lt 10) {
+                Start-Sleep -Milliseconds 100
+            }
+            $marker = '{0} OBSERVER_READY={1} observer_pid={2}' -f [DateTime]::UtcNow.ToString('o'), [IO.File]::Exists($observerReadyPath), $observer.Id
+            [IO.File]::AppendAllText($diagnosticPath, "$marker`n")
+            Write-Host $marker
+        }
+        catch {
+            $marker = '{0} OBSERVER_START_FAILED type={1} hresult={2}' -f [DateTime]::UtcNow.ToString('o'), $_.Exception.GetType().FullName, $_.Exception.HResult
+            [IO.File]::AppendAllText($diagnosticPath, "$marker`n")
+            Write-Host $marker
+        }
+        finally {
+            if ($null -ne $observer) { $observer.Dispose() } # Releases our handle; does not terminate it.
+        }
         $rootStore = [IntPtr]::Zero
         [int]$openError = 0
         [int]$importError = 0
@@ -158,7 +211,7 @@ public static class Local182CryptUI
             $marker = '{0} BEFORE CryptUIWizImport CurrentUser/Root flags=0x00020001 (NO_UI)' -f [DateTime]::UtcNow.ToString('o')
             [IO.File]::AppendAllText($diagnosticPath, "$marker`n")
             Write-Host $marker
-            $imported = [Local182CryptUI]::ImportCertificate($rootStore, $testCertificate, [ref]$importError)
+            $imported = [Local182CryptUI]::ImportCertificate($rootStore, $testCertificate, $nativeBoundaryPath, [ref]$importError)
             $marker = '{0} AFTER CryptUIWizImport success={1} win32={2}' -f [DateTime]::UtcNow.ToString('o'), $imported, $importError
             [IO.File]::AppendAllText($diagnosticPath, "$marker`n")
             Write-Host $marker
