@@ -176,6 +176,10 @@
         visibility: hidden !important;
         pointer-events: none !important;
       }
+      [${HIDDEN_ATTRIBUTE}="true"] nav[data-app-navigation-rail] {
+        visibility: visible !important;
+        pointer-events: auto !important;
+      }
       [${NATIVE_SELECTED_ATTRIBUTE}="true"] {
         background-color: transparent !important;
       }
@@ -319,6 +323,9 @@
 
   function syncEntryState() {
     if (!entry) return;
+    if (entry.hasAttribute("data-selected") !== active) {
+      entry.toggleAttribute("data-selected", active);
+    }
     if (active && entry.getAttribute("aria-current") !== "page") {
       entry.setAttribute("aria-current", "page");
     } else if (!active && entry.hasAttribute("aria-current")) {
@@ -355,28 +362,34 @@
   function findPageMount() {
     const frameHost = findPageHost();
     const viewport = frameHost?.closest?.("[data-app-shell-main-content-layout]");
-    const surface = viewport?.parentElement;
-    if (!frameHost || !viewport || !surface || !surface.closest("main")) return null;
-    return { frameHost, surface };
+    const surface = viewport?.closest("[data-app-shell-workspace-row]");
+    const rail = surface?.querySelector("nav[data-app-navigation-rail]");
+    if (!frameHost || !viewport || !surface || !rail) return null;
+    return { frameHost, surface, rail };
   }
 
   function muteNativeSelection() {
     if (!active) return;
-    document.querySelectorAll('aside nav[role="navigation"] [aria-current], nav[data-app-navigation-rail] [aria-current]')
+    document.querySelectorAll('aside nav[role="navigation"] [aria-current], nav[data-app-navigation-rail] :is([aria-current], [data-selected])')
       .forEach((node) => {
         if (node === entry || node.closest(`#${ENTRY_ID}`)) return;
         if (!mutedNativeSelections.has(node)) {
-          mutedNativeSelections.set(node, node.getAttribute("aria-current"));
+          mutedNativeSelections.set(node, {
+            ariaCurrent: node.getAttribute("aria-current"),
+            selected: node.getAttribute("data-selected"),
+          });
         }
         node.removeAttribute("aria-current");
+        node.removeAttribute("data-selected");
         node.setAttribute(NATIVE_SELECTED_ATTRIBUTE, "true");
       });
   }
 
   function restoreNativeSelection() {
-    mutedNativeSelections.forEach((ariaCurrent, node) => {
+    mutedNativeSelections.forEach(({ ariaCurrent, selected }, node) => {
       if (!node.isConnected) return;
-      node.setAttribute("aria-current", ariaCurrent);
+      if (ariaCurrent !== null) node.setAttribute("aria-current", ariaCurrent);
+      if (selected !== null) node.setAttribute("data-selected", selected);
       node.removeAttribute(NATIVE_SELECTED_ATTRIBUTE);
     });
     mutedNativeSelections.clear();
@@ -661,7 +674,7 @@
   function titlebarLeftInset() {
     if (!/Macintosh|Mac OS X/.test(navigator.userAgent)) return 0;
     if (nativeSidebarCollapsed()) return MACOS_TITLEBAR_SAFE_LEFT;
-    const surfaceLeft = findPageMount()?.surface.getBoundingClientRect().left;
+    const surfaceLeft = findPageMount()?.rail.getBoundingClientRect().right;
     if (!Number.isFinite(surfaceLeft)) return 0;
     return Math.max(0, Math.ceil(MACOS_TITLEBAR_SAFE_LEFT - surfaceLeft));
   }
@@ -1792,7 +1805,7 @@
     if (!page) page = createPage();
     const mount = findPageMount();
     if (!mount) return false;
-    const { surface } = mount;
+    const { surface, rail } = mount;
 
     let remounted = false;
     if (page.parentElement !== surface) {
@@ -1806,6 +1819,7 @@
       }
     }
     surface.setAttribute(HOST_ATTRIBUTE, "true");
+    page.style.left = `${rail.getBoundingClientRect().right - surface.getBoundingClientRect().left}px`;
     Array.from(surface.children).forEach((child) => {
       if (child !== page && child.getAttribute(OWNED_ATTRIBUTE) !== "true") {
         child.setAttribute(HIDDEN_ATTRIBUTE, "true");
@@ -1914,6 +1928,7 @@
         "data-app-action-sidebar-thread-active",
         "aria-label",
         "aria-current",
+        "data-selected",
       ],
     });
     hostContextTimer = window.setInterval(postHostContext, 1_000);

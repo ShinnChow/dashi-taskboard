@@ -43,7 +43,7 @@ test("entry clones the native Explore rail button and the page covers the comple
   assert.match(source, /const button = reference\.cloneNode\(true\)/);
   assert.match(source, /reference\.before\(entry\)/);
   assert.match(source, /document\.querySelector\("\.app-shell-main-content-frame"\)/);
-  assert.match(source, /const surface = viewport\?\.parentElement/);
+  assert.match(source, /const surface = viewport\?\.closest\("\[data-app-shell-workspace-row\]"\)/);
   assert.match(source, /surface\.appendChild\(page\)/);
   assert.match(source, /#\$\{PAGE_ID\} \{[\s\S]*?top: 0;/);
   assert.doesNotMatch(source, /--codex-taskboard-top-offset/);
