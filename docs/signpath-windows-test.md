@@ -82,7 +82,7 @@ gh workflow run signpath-windows-test.yml --repo chuspeeism/dashi-taskboard --re
 并与 `signpath-windows-test-evidence-<run_id>-<run_attempt>` 中的清单核对哈希。
 该 ZIP 可用于账户侧检查产物配置。
 
-完成账户与 GitHub 配置后，再运行：
+完成账户与 GitHub 配置，并获得下节所述机器级临时信任的明确授权后，再运行：
 
 ```sh
 gh workflow run signpath-windows-test.yml --repo chuspeeism/dashi-taskboard --ref <approved-branch> -f sign=true
@@ -95,9 +95,23 @@ gh workflow run signpath-windows-test.yml --repo chuspeeism/dashi-taskboard --re
 ## 验证结果
 
 `scripts/verify-signpath-windows-test.ps1` 先检查两个返回文件和签名叶证书 SHA-256，
-再仅在一次性 GitHub-hosted Windows runner 的 `CurrentUser/Root` 暂时信任该公开证书。
-它不修改开发者、最终用户或自托管 runner 的信任库，也不修改 `LocalMachine`。
-`finally` 移除本次新增的证书；强制终止可能跳过清理，因此只允许一次性 hosted runner。
+再仅在一次性 GitHub-hosted Windows runner 的 `LocalMachine/Root` 暂时信任该公开证书。
+这是该 VM 的机器级信任，对该机所有用户可用，不是只作用于验签进程；必须单独授权，
+此前的 `CurrentUser/Root` 或 NO_UI 授权不覆盖此范围。本次已确认的公开证书 DER SHA-256 为
+`1C1CF94CBE6DE16C359FE49BC3900FFCA04FEF68369E4EA597164A97222CA733`；
+现有 `SIGNPATH_TEST_CERTIFICATE_SHA256` 变量须保持该独立确认值，换证书需重新确认。
+
+导入使用 `Import-Certificate -FilePath $certificatePath -CertStoreLocation 'Cert:\LocalMachine\Root'`，
+依据 [SignPath 的脚本示例](https://signpath.io/knowledge-base/test-certificates#using-scripts-and-batch-files)
+和 [Microsoft Import-Certificate Example 3](https://learn.microsoft.com/en-us/powershell/module/pki/import-certificate#example-3)。
+系统库写入要求管理员权限；[GitHub 的 Windows hosted VM](https://docs.github.com/en/actions/reference/runners/github-hosted-runners#administrative-privileges)
+默认以管理员运行且 UAC 已禁用。这是平台配置说明，本脚本不提权、不改 UAC 或保护策略，
+不抑制或自动点击安全提示。官方示例不代替本 runner 上的真实验证；失败不切换库或放宽验签。
+
+先检查同一 `Cert:\LocalMachine\Root\<thumbprint>` 路径；已有证书不重导入、不删除。
+仅在该路径原先不存在时导入，`finally` 用 `Remove-Item -LiteralPath $storePath` 移除本次新增信任。
+不修改开发者、最终用户或自托管 runner 的信任库；Mac 只做文件审查，不执行信任导入。
+强制终止可能跳过清理，因此只允许一次性 hosted runner；没有清理证据不能宣称已移除。
 
 两个 PE 都必须通过 `signtool verify /pa /all /v`，退出码为 0；随后
 `Get-AuthenticodeSignature` 必须返回嵌入式 `Authenticode`、`Valid` 和匹配的证书指纹。
@@ -112,6 +126,9 @@ gh workflow run signpath-windows-test.yml --repo chuspeeism/dashi-taskboard --re
 - 两个 `*.signtool.txt`：Windows 验证日志。
 - `test-signer.cer`：已核对身份的公开证书。
 
+直接路径的 UTC 导入、验签和清理日志在 Actions job log 中；不再运行 P/Invoke 或窗口观察器。
+报告的 `trust_scope` 应为 `LocalMachine/Root`；本次实际新增时，核对 `temporary_trust_removed: true`。
+若导入前证书已存在，该字段为 false，表示没有移除既有信任，不应据此删除它。
 进入临时信任阶段后，验证失败也会写报告；文件集合或身份预检查失败可能只有步骤错误日志。
 准备模式的绿色结果不能当作签名通过。普通工作站无需导入测试根证书；下载后可比对证据哈希，
 完整性结论以一次性 runner 的验证记录为准。测试结果不证明安装、更新、内部签名或公开信任。

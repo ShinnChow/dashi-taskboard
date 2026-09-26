@@ -60,206 +60,30 @@ foreach ($name in $names) {
 # it is NOT proof that the PE signature or file digest is valid.
 $certificatePath = Join-Path $EvidenceDirectory 'test-signer.cer'
 [IO.File]::WriteAllBytes($certificatePath, $testCertificate.RawData)
-$storePath = "Cert:\CurrentUser\Root\$($testCertificate.Thumbprint)"
-$diagnosticPath = Join-Path $EvidenceDirectory 'verification-boundaries.log'
-$marker = '{0} BEFORE Test-Path pre-import store={1}' -f [DateTime]::UtcNow.ToString('o'), $storePath
-[IO.File]::AppendAllText($diagnosticPath, "$marker`n")
-Write-Host $marker
+$storePath = "Cert:\LocalMachine\Root\$($testCertificate.Thumbprint)"
 $addedTrust = -not (Test-Path -LiteralPath $storePath)
-$marker = '{0} AFTER Test-Path pre-import addedTrust={1}' -f [DateTime]::UtcNow.ToString('o'), $addedTrust
-[IO.File]::AppendAllText($diagnosticPath, "$marker`n")
-Write-Host $marker
+Write-Host ('{0} TRUST store={1} addedTrust={2}' -f [DateTime]::UtcNow.ToString('o'), $storePath, $addedTrust)
 $verified = $false
 try {
     if ($addedTrust) {
-        Add-Type -TypeDefinition @'
-using System;
-using System.Diagnostics;
-using System.IO;
-using System.Runtime.InteropServices;
-using System.Security.Cryptography.X509Certificates;
-
-public static class Local182CryptUI
-{
-    // x64: offsets 0, 4, 8, 16, 24; size 32. The union is one pointer.
-    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode, Pack = 8)]
-    private struct CRYPTUI_WIZ_IMPORT_SRC_INFO
-    {
-        public uint dwSize;
-        public uint dwSubjectChoice;
-        public IntPtr pCertContext;
-        public uint dwFlags;
-        [MarshalAs(UnmanagedType.LPWStr)] public string pwszPassword;
-    }
-
-    [DllImport("crypt32.dll", ExactSpelling = true, CharSet = CharSet.Unicode, SetLastError = true)]
-    private static extern IntPtr CertOpenStore(IntPtr provider, uint encoding,
-        IntPtr cryptProvider, uint flags, string storeName);
-
-    [DllImport("cryptui.dll", ExactSpelling = true, CharSet = CharSet.Unicode, SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool CryptUIWizImport(uint flags, IntPtr parent, string title,
-        [In] ref CRYPTUI_WIZ_IMPORT_SRC_INFO source, IntPtr destination);
-
-    [DllImport("crypt32.dll", ExactSpelling = true, SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool CertCloseStore(IntPtr store, uint flags);
-
-    [DllImport("kernel32.dll", ExactSpelling = true)]
-    private static extern uint GetCurrentThreadId();
-
-    // Capture each cached Win32 error before returning to PowerShell.
-    public static IntPtr OpenRoot(out int error)
-    {
-        // CERT_STORE_PROV_SYSTEM_W; CURRENT_USER | OPEN_EXISTING.
-        IntPtr store = CertOpenStore(new IntPtr(10), 0, IntPtr.Zero, 0x00014000, "Root");
-        error = Marshal.GetLastWin32Error();
-        return store;
-    }
-
-    public static bool ImportCertificate(IntPtr store, X509Certificate2 certificate, string boundaryPath, out int error)
-    {
-        var source = new CRYPTUI_WIZ_IMPORT_SRC_INFO {
-            dwSize = (uint)Marshal.SizeOf<CRYPTUI_WIZ_IMPORT_SRC_INFO>(),
-            dwSubjectChoice = 2, // CRYPTUI_WIZ_IMPORT_SUBJECT_CERT_CONTEXT
-            pCertContext = certificate.Handle,
-            dwFlags = 0,
-            pwszPassword = string.Empty
-        };
-        try {
-            string identity;
-            using (var process = Process.GetCurrentProcess()) {
-                DateTime created = process.StartTime.ToUniversalTime();
-                identity = FormattableString.Invariant(
-                    $"\"pid\":{process.Id},\"process_start_utc\":\"{created:o}\",\"process_start_utc_ticks\":{created.Ticks}");
-            }
-            uint nativeTid = GetCurrentThreadId();
-            DateTime entered = DateTime.UtcNow;
-            // Source preparation is complete; the next operation after this write is the P/Invoke.
-            File.AppendAllText(boundaryPath, FormattableString.Invariant(
-                $"{{\"phase\":\"NATIVE_ENTER\",\"utc\":\"{entered:o}\",\"utc_ticks\":{entered.Ticks},{identity},\"native_tid\":{nativeTid}}}\n"));
-            // CRYPTUI_WIZ_NO_UI | CRYPTUI_WIZ_IMPORT_ALLOW_CERT.
-            bool imported = CryptUIWizImport(0x00020001, IntPtr.Zero, null, ref source, store);
-            error = Marshal.GetLastWin32Error();
-            DateTime returned = DateTime.UtcNow;
-            File.AppendAllText(boundaryPath, FormattableString.Invariant(
-                $"{{\"phase\":\"NATIVE_RETURN\",\"utc\":\"{returned:o}\",\"utc_ticks\":{returned.Ticks},{identity},\"native_tid\":{GetCurrentThreadId()},\"success\":{(imported ? "true" : "false")},\"win32\":{error}}}\n"));
-            return imported;
-        }
-        finally {
-            GC.KeepAlive(certificate); // The borrowed PCCERT_CONTEXT belongs to this object.
-        }
-    }
-
-    public static bool CloseRoot(IntPtr store, out int error)
-    {
-        bool closed = CertCloseStore(store, 0);
-        error = Marshal.GetLastWin32Error();
-        return closed;
-    }
-}
-'@
-        $nativeBoundaryPath = Join-Path $EvidenceDirectory 'cryptui-native-boundary.jsonl'
-        $observerReadyPath = Join-Path $EvidenceDirectory 'cryptui-observer.ready'
-        $observer = $null
-        try {
-            $self = [Diagnostics.Process]::GetCurrentProcess()
-            try { $createdTicks = $self.StartTime.ToUniversalTime().Ticks }
-            finally { $self.Dispose() }
-            $startInfo = [Diagnostics.ProcessStartInfo]::new((Join-Path $PSHOME 'pwsh.exe'))
-            $startInfo.UseShellExecute = $false
-            foreach ($argument in @('-NoLogo', '-NoProfile', '-NonInteractive', '-File',
-                (Join-Path $PSScriptRoot 'observe-signpath-cryptui.ps1'),
-                '-TargetProcessId', [string]$PID, '-TargetStartTicks', [string]$createdTicks,
-                '-EvidenceDirectory', $EvidenceDirectory)) {
-                $startInfo.ArgumentList.Add($argument)
-            }
-            $observer = [Diagnostics.Process]::Start($startInfo)
-            # Only bound observer startup, not import/verification runtime; never kill the target.
-            $startup = [Diagnostics.Stopwatch]::StartNew()
-            while (-not [IO.File]::Exists($observerReadyPath) -and -not $observer.HasExited -and
-                $startup.Elapsed.TotalSeconds -lt 10) {
-                Start-Sleep -Milliseconds 100
-            }
-            $marker = '{0} OBSERVER_READY={1} observer_pid={2}' -f [DateTime]::UtcNow.ToString('o'), [IO.File]::Exists($observerReadyPath), $observer.Id
-            [IO.File]::AppendAllText($diagnosticPath, "$marker`n")
-            Write-Host $marker
-        }
-        catch {
-            $marker = '{0} OBSERVER_START_FAILED type={1} hresult={2}' -f [DateTime]::UtcNow.ToString('o'), $_.Exception.GetType().FullName, $_.Exception.HResult
-            [IO.File]::AppendAllText($diagnosticPath, "$marker`n")
-            Write-Host $marker
-        }
-        finally {
-            if ($null -ne $observer) { $observer.Dispose() } # Releases our handle; does not terminate it.
-        }
-        $rootStore = [IntPtr]::Zero
-        [int]$openError = 0
-        [int]$importError = 0
-        [int]$closeError = 0
-        try {
-            $marker = '{0} BEFORE CertOpenStore CurrentUser/Root flags=0x00014000' -f [DateTime]::UtcNow.ToString('o')
-            [IO.File]::AppendAllText($diagnosticPath, "$marker`n")
-            Write-Host $marker
-            $rootStore = [Local182CryptUI]::OpenRoot([ref]$openError)
-            $marker = '{0} AFTER CertOpenStore success={1} win32={2}' -f [DateTime]::UtcNow.ToString('o'), ($rootStore -ne [IntPtr]::Zero), $openError
-            [IO.File]::AppendAllText($diagnosticPath, "$marker`n")
-            Write-Host $marker
-            if ($rootStore -eq [IntPtr]::Zero) {
-                throw "CertOpenStore CurrentUser/Root failed with Win32 error $openError."
-            }
-            $marker = '{0} BEFORE CryptUIWizImport CurrentUser/Root flags=0x00020001 (NO_UI)' -f [DateTime]::UtcNow.ToString('o')
-            [IO.File]::AppendAllText($diagnosticPath, "$marker`n")
-            Write-Host $marker
-            $imported = [Local182CryptUI]::ImportCertificate($rootStore, $testCertificate, $nativeBoundaryPath, [ref]$importError)
-            $marker = '{0} AFTER CryptUIWizImport success={1} win32={2}' -f [DateTime]::UtcNow.ToString('o'), $imported, $importError
-            [IO.File]::AppendAllText($diagnosticPath, "$marker`n")
-            Write-Host $marker
-            if (-not $imported) {
-                throw "CryptUIWizImport CurrentUser/Root failed with Win32 error $importError."
-            }
-        }
-        finally {
-            if ($rootStore -ne [IntPtr]::Zero) {
-                try {
-                    $marker = '{0} BEFORE CertCloseStore CurrentUser/Root' -f [DateTime]::UtcNow.ToString('o')
-                    [IO.File]::AppendAllText($diagnosticPath, "$marker`n")
-                    Write-Host $marker
-                }
-                finally {
-                    $closed = [Local182CryptUI]::CloseRoot($rootStore, [ref]$closeError)
-                }
-                $marker = '{0} AFTER CertCloseStore success={1} win32={2}' -f [DateTime]::UtcNow.ToString('o'), $closed, $closeError
-                [IO.File]::AppendAllText($diagnosticPath, "$marker`n")
-                Write-Host $marker
-                if (-not $closed) {
-                    throw "CertCloseStore failed with Win32 error $closeError."
-                }
-            }
-        }
+        Write-Host ('{0} BEFORE Import-Certificate LocalMachine/Root' -f [DateTime]::UtcNow.ToString('o'))
+        Import-Certificate -FilePath $certificatePath -CertStoreLocation 'Cert:\LocalMachine\Root' | Out-Null
+        Write-Host ('{0} AFTER Import-Certificate LocalMachine/Root' -f [DateTime]::UtcNow.ToString('o'))
     }
     foreach ($record in $records) {
         $path = Join-Path $ArtifactDirectory $record.artifact_path
         # /pa checks Authenticode rather than driver policy; no /a catalog fallback.
         # /all checks every embedded signature. Any nonzero exit, even a warning, fails.
-        $marker = '{0} BEFORE SignTool pipeline file={1} tool={2}' -f [DateTime]::UtcNow.ToString('o'), $record.artifact_path, $signTool.FullName
-        [IO.File]::AppendAllText($diagnosticPath, "$marker`n")
-        Write-Host $marker
+        Write-Host ('{0} BEFORE SignTool file={1}' -f [DateTime]::UtcNow.ToString('o'), $record.artifact_path)
         & $signTool.FullName verify /pa /all /v $path 2>&1 |
             Tee-Object -FilePath (Join-Path $EvidenceDirectory "$($record.artifact_path).signtool.txt")
         $record.signtool_exit_code = $LASTEXITCODE
-        $marker = '{0} AFTER SignTool pipeline file={1} exit={2}' -f [DateTime]::UtcNow.ToString('o'), $record.artifact_path, $record.signtool_exit_code
-        [IO.File]::AppendAllText($diagnosticPath, "$marker`n")
-        Write-Host $marker
+        Write-Host ('{0} AFTER SignTool file={1} exit={2}' -f [DateTime]::UtcNow.ToString('o'), $record.artifact_path, $record.signtool_exit_code)
         if ($LASTEXITCODE -ne 0) { throw "SignTool integrity/policy verification failed for $($record.artifact_path)." }
-        $marker = '{0} BEFORE Get-AuthenticodeSignature post-trust file={1}' -f [DateTime]::UtcNow.ToString('o'), $record.artifact_path
-        [IO.File]::AppendAllText($diagnosticPath, "$marker`n")
-        Write-Host $marker
+        Write-Host ('{0} BEFORE Get-AuthenticodeSignature file={1}' -f [DateTime]::UtcNow.ToString('o'), $record.artifact_path)
         $signature = Get-AuthenticodeSignature -LiteralPath $path
-        $marker = '{0} AFTER Get-AuthenticodeSignature post-trust file={1} status={2}' -f [DateTime]::UtcNow.ToString('o'), $record.artifact_path, $signature.Status
-        [IO.File]::AppendAllText($diagnosticPath, "$marker`n")
-        Write-Host $marker
         $record.status_after_temporary_trust = [string]$signature.Status
+        Write-Host ('{0} AFTER Get-AuthenticodeSignature file={1} status={2}' -f [DateTime]::UtcNow.ToString('o'), $record.artifact_path, $record.status_after_temporary_trust)
         if ($signature.Status -ne 'Valid' -or $signature.SignatureType -ne 'Authenticode' -or
             $null -eq $signature.SignerCertificate -or
             $signature.SignerCertificate.GetCertHashString([Security.Cryptography.HashAlgorithmName]::SHA256) -ne $ExpectedSignerSha256) {
@@ -269,30 +93,17 @@ public static class Local182CryptUI
     $verified = $true
 }
 finally {
-    $marker = '{0} BEFORE finally cleanup addedTrust={1}' -f [DateTime]::UtcNow.ToString('o'), $addedTrust
-    [IO.File]::AppendAllText($diagnosticPath, "$marker`n")
-    Write-Host $marker
+    Write-Host ('{0} BEFORE cleanup store={1} addedTrust={2}' -f [DateTime]::UtcNow.ToString('o'), $storePath, $addedTrust)
     if ($addedTrust -and (Test-Path -LiteralPath $storePath)) {
-        $marker = '{0} BEFORE Remove-Item temporary trust' -f [DateTime]::UtcNow.ToString('o')
-        [IO.File]::AppendAllText($diagnosticPath, "$marker`n")
-        Write-Host $marker
-        Remove-Item -LiteralPath $storePath -Force
-        $marker = '{0} AFTER Remove-Item temporary trust' -f [DateTime]::UtcNow.ToString('o')
-        [IO.File]::AppendAllText($diagnosticPath, "$marker`n")
-        Write-Host $marker
+        Remove-Item -LiteralPath $storePath
     }
-    $marker = '{0} AFTER finally cleanup; BEFORE verification-report pipeline' -f [DateTime]::UtcNow.ToString('o')
-    [IO.File]::AppendAllText($diagnosticPath, "$marker`n")
-    Write-Host $marker
+    Write-Host ('{0} AFTER cleanup store={1}' -f [DateTime]::UtcNow.ToString('o'), $storePath)
     [ordered]@{
         verified = $verified
         expected_signer_sha256 = $ExpectedSignerSha256.ToUpperInvariant()
-        trust_scope = 'Disposable GitHub-hosted runner CurrentUser/Root only; not public trust.'
+        trust_scope = 'Disposable GitHub-hosted runner LocalMachine/Root only; not public trust.'
         temporary_trust_removed = $addedTrust -and -not (Test-Path -LiteralPath $storePath)
         files = $records
     } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'verification.json') -Encoding utf8
-    $marker = '{0} AFTER verification-report pipeline verified={1}' -f [DateTime]::UtcNow.ToString('o'), $verified
-    [IO.File]::AppendAllText($diagnosticPath, "$marker`n")
-    Write-Host $marker
 }
 Write-Host 'PASS: both PE signatures are intact and match the pinned test certificate; temporary runner trust has been cleaned up.'
