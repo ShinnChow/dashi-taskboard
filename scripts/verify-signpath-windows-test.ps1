@@ -72,17 +72,117 @@ Write-Host $marker
 $verified = $false
 try {
     if ($addedTrust) {
-        $marker = '{0} BEFORE certutil -user -addstore Root pipeline' -f [DateTime]::UtcNow.ToString('o')
-        [IO.File]::AppendAllText($diagnosticPath, "$marker`n")
-        Write-Host $marker
-        & "$env:SystemRoot\System32\certutil.exe" -user -addstore Root $certificatePath 2>&1 |
-            Tee-Object -FilePath (Join-Path $EvidenceDirectory 'certificate-import.certutil.txt')
-        $importExitCode = $LASTEXITCODE
-        $marker = '{0} AFTER certutil -user -addstore Root pipeline exit={1}' -f [DateTime]::UtcNow.ToString('o'), $importExitCode
-        [IO.File]::AppendAllText($diagnosticPath, "$marker`n")
-        Write-Host $marker
-        if ($importExitCode -ne 0) {
-            throw "certutil CurrentUser/Root import failed with exit code $importExitCode."
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Security.Cryptography.X509Certificates;
+
+public static class Local182CryptUI
+{
+    // x64: offsets 0, 4, 8, 16, 24; size 32. The union is one pointer.
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode, Pack = 8)]
+    private struct CRYPTUI_WIZ_IMPORT_SRC_INFO
+    {
+        public uint dwSize;
+        public uint dwSubjectChoice;
+        public IntPtr pCertContext;
+        public uint dwFlags;
+        [MarshalAs(UnmanagedType.LPWStr)] public string pwszPassword;
+    }
+
+    [DllImport("crypt32.dll", ExactSpelling = true, CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr CertOpenStore(IntPtr provider, uint encoding,
+        IntPtr cryptProvider, uint flags, string storeName);
+
+    [DllImport("cryptui.dll", ExactSpelling = true, CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CryptUIWizImport(uint flags, IntPtr parent, string title,
+        [In] ref CRYPTUI_WIZ_IMPORT_SRC_INFO source, IntPtr destination);
+
+    [DllImport("crypt32.dll", ExactSpelling = true, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CertCloseStore(IntPtr store, uint flags);
+
+    // Capture each cached Win32 error before returning to PowerShell.
+    public static IntPtr OpenRoot(out int error)
+    {
+        // CERT_STORE_PROV_SYSTEM_W; CURRENT_USER | OPEN_EXISTING.
+        IntPtr store = CertOpenStore(new IntPtr(10), 0, IntPtr.Zero, 0x00014000, "Root");
+        error = Marshal.GetLastWin32Error();
+        return store;
+    }
+
+    public static bool ImportCertificate(IntPtr store, X509Certificate2 certificate, out int error)
+    {
+        var source = new CRYPTUI_WIZ_IMPORT_SRC_INFO {
+            dwSize = (uint)Marshal.SizeOf<CRYPTUI_WIZ_IMPORT_SRC_INFO>(),
+            dwSubjectChoice = 2, // CRYPTUI_WIZ_IMPORT_SUBJECT_CERT_CONTEXT
+            pCertContext = certificate.Handle,
+            dwFlags = 0,
+            pwszPassword = string.Empty
+        };
+        try {
+            // CRYPTUI_WIZ_NO_UI | CRYPTUI_WIZ_IMPORT_ALLOW_CERT.
+            bool imported = CryptUIWizImport(0x00020001, IntPtr.Zero, null, ref source, store);
+            error = Marshal.GetLastWin32Error();
+            return imported;
+        }
+        finally {
+            GC.KeepAlive(certificate); // The borrowed PCCERT_CONTEXT belongs to this object.
+        }
+    }
+
+    public static bool CloseRoot(IntPtr store, out int error)
+    {
+        bool closed = CertCloseStore(store, 0);
+        error = Marshal.GetLastWin32Error();
+        return closed;
+    }
+}
+'@
+        $rootStore = [IntPtr]::Zero
+        [int]$openError = 0
+        [int]$importError = 0
+        [int]$closeError = 0
+        try {
+            $marker = '{0} BEFORE CertOpenStore CurrentUser/Root flags=0x00014000' -f [DateTime]::UtcNow.ToString('o')
+            [IO.File]::AppendAllText($diagnosticPath, "$marker`n")
+            Write-Host $marker
+            $rootStore = [Local182CryptUI]::OpenRoot([ref]$openError)
+            $marker = '{0} AFTER CertOpenStore success={1} win32={2}' -f [DateTime]::UtcNow.ToString('o'), ($rootStore -ne [IntPtr]::Zero), $openError
+            [IO.File]::AppendAllText($diagnosticPath, "$marker`n")
+            Write-Host $marker
+            if ($rootStore -eq [IntPtr]::Zero) {
+                throw "CertOpenStore CurrentUser/Root failed with Win32 error $openError."
+            }
+            $marker = '{0} BEFORE CryptUIWizImport CurrentUser/Root flags=0x00020001 (NO_UI)' -f [DateTime]::UtcNow.ToString('o')
+            [IO.File]::AppendAllText($diagnosticPath, "$marker`n")
+            Write-Host $marker
+            $imported = [Local182CryptUI]::ImportCertificate($rootStore, $testCertificate, [ref]$importError)
+            $marker = '{0} AFTER CryptUIWizImport success={1} win32={2}' -f [DateTime]::UtcNow.ToString('o'), $imported, $importError
+            [IO.File]::AppendAllText($diagnosticPath, "$marker`n")
+            Write-Host $marker
+            if (-not $imported) {
+                throw "CryptUIWizImport CurrentUser/Root failed with Win32 error $importError."
+            }
+        }
+        finally {
+            if ($rootStore -ne [IntPtr]::Zero) {
+                try {
+                    $marker = '{0} BEFORE CertCloseStore CurrentUser/Root' -f [DateTime]::UtcNow.ToString('o')
+                    [IO.File]::AppendAllText($diagnosticPath, "$marker`n")
+                    Write-Host $marker
+                }
+                finally {
+                    $closed = [Local182CryptUI]::CloseRoot($rootStore, [ref]$closeError)
+                }
+                $marker = '{0} AFTER CertCloseStore success={1} win32={2}' -f [DateTime]::UtcNow.ToString('o'), $closed, $closeError
+                [IO.File]::AppendAllText($diagnosticPath, "$marker`n")
+                Write-Host $marker
+                if (-not $closed) {
+                    throw "CertCloseStore failed with Win32 error $closeError."
+                }
+            }
         }
     }
     foreach ($record in $records) {
