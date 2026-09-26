@@ -61,21 +61,46 @@ foreach ($name in $names) {
 $certificatePath = Join-Path $EvidenceDirectory 'test-signer.cer'
 [IO.File]::WriteAllBytes($certificatePath, $testCertificate.RawData)
 $storePath = "Cert:\CurrentUser\Root\$($testCertificate.Thumbprint)"
+$diagnosticPath = Join-Path $EvidenceDirectory 'verification-boundaries.log'
+$marker = '{0} BEFORE Test-Path pre-import store={1}' -f [DateTime]::UtcNow.ToString('o'), $storePath
+[IO.File]::AppendAllText($diagnosticPath, "$marker`n")
+Write-Host $marker
 $addedTrust = -not (Test-Path -LiteralPath $storePath)
+$marker = '{0} AFTER Test-Path pre-import addedTrust={1}' -f [DateTime]::UtcNow.ToString('o'), $addedTrust
+[IO.File]::AppendAllText($diagnosticPath, "$marker`n")
+Write-Host $marker
 $verified = $false
 try {
     if ($addedTrust) {
+        $marker = '{0} BEFORE Import-Certificate' -f [DateTime]::UtcNow.ToString('o')
+        [IO.File]::AppendAllText($diagnosticPath, "$marker`n")
+        Write-Host $marker
         Import-Certificate -FilePath $certificatePath -CertStoreLocation 'Cert:\CurrentUser\Root' | Out-Null
+        $marker = '{0} AFTER Import-Certificate' -f [DateTime]::UtcNow.ToString('o')
+        [IO.File]::AppendAllText($diagnosticPath, "$marker`n")
+        Write-Host $marker
     }
     foreach ($record in $records) {
         $path = Join-Path $ArtifactDirectory $record.artifact_path
         # /pa checks Authenticode rather than driver policy; no /a catalog fallback.
         # /all checks every embedded signature. Any nonzero exit, even a warning, fails.
+        $marker = '{0} BEFORE SignTool pipeline file={1} tool={2}' -f [DateTime]::UtcNow.ToString('o'), $record.artifact_path, $signTool.FullName
+        [IO.File]::AppendAllText($diagnosticPath, "$marker`n")
+        Write-Host $marker
         & $signTool.FullName verify /pa /all /v $path 2>&1 |
             Tee-Object -FilePath (Join-Path $EvidenceDirectory "$($record.artifact_path).signtool.txt")
         $record.signtool_exit_code = $LASTEXITCODE
+        $marker = '{0} AFTER SignTool pipeline file={1} exit={2}' -f [DateTime]::UtcNow.ToString('o'), $record.artifact_path, $record.signtool_exit_code
+        [IO.File]::AppendAllText($diagnosticPath, "$marker`n")
+        Write-Host $marker
         if ($LASTEXITCODE -ne 0) { throw "SignTool integrity/policy verification failed for $($record.artifact_path)." }
+        $marker = '{0} BEFORE Get-AuthenticodeSignature post-trust file={1}' -f [DateTime]::UtcNow.ToString('o'), $record.artifact_path
+        [IO.File]::AppendAllText($diagnosticPath, "$marker`n")
+        Write-Host $marker
         $signature = Get-AuthenticodeSignature -LiteralPath $path
+        $marker = '{0} AFTER Get-AuthenticodeSignature post-trust file={1} status={2}' -f [DateTime]::UtcNow.ToString('o'), $record.artifact_path, $signature.Status
+        [IO.File]::AppendAllText($diagnosticPath, "$marker`n")
+        Write-Host $marker
         $record.status_after_temporary_trust = [string]$signature.Status
         if ($signature.Status -ne 'Valid' -or $signature.SignatureType -ne 'Authenticode' -or
             $null -eq $signature.SignerCertificate -or
@@ -86,9 +111,21 @@ try {
     $verified = $true
 }
 finally {
+    $marker = '{0} BEFORE finally cleanup addedTrust={1}' -f [DateTime]::UtcNow.ToString('o'), $addedTrust
+    [IO.File]::AppendAllText($diagnosticPath, "$marker`n")
+    Write-Host $marker
     if ($addedTrust -and (Test-Path -LiteralPath $storePath)) {
+        $marker = '{0} BEFORE Remove-Item temporary trust' -f [DateTime]::UtcNow.ToString('o')
+        [IO.File]::AppendAllText($diagnosticPath, "$marker`n")
+        Write-Host $marker
         Remove-Item -LiteralPath $storePath -Force
+        $marker = '{0} AFTER Remove-Item temporary trust' -f [DateTime]::UtcNow.ToString('o')
+        [IO.File]::AppendAllText($diagnosticPath, "$marker`n")
+        Write-Host $marker
     }
+    $marker = '{0} AFTER finally cleanup; BEFORE verification-report pipeline' -f [DateTime]::UtcNow.ToString('o')
+    [IO.File]::AppendAllText($diagnosticPath, "$marker`n")
+    Write-Host $marker
     [ordered]@{
         verified = $verified
         expected_signer_sha256 = $ExpectedSignerSha256.ToUpperInvariant()
@@ -96,5 +133,8 @@ finally {
         temporary_trust_removed = $addedTrust -and -not (Test-Path -LiteralPath $storePath)
         files = $records
     } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'verification.json') -Encoding utf8
+    $marker = '{0} AFTER verification-report pipeline verified={1}' -f [DateTime]::UtcNow.ToString('o'), $verified
+    [IO.File]::AppendAllText($diagnosticPath, "$marker`n")
+    Write-Host $marker
 }
 Write-Host 'PASS: both PE signatures are intact and match the pinned test certificate; temporary runner trust has been cleaned up.'
