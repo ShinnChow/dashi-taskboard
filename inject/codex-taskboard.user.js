@@ -28,7 +28,7 @@
   const HOST_HEARTBEAT_MAX_AGE_MS = 8_000;
   const MACOS_TITLEBAR_SAFE_LEFT = 80;
   const FRAME_REFRESH_PARAM = "__codex_taskboard_refresh";
-  const PLUGIN_LABELS = ["插件", "plugins", "外掛程式", "プラグイン"];
+  const EXPLORE_LABELS = ["探索", "explore"];
   const NATIVE_PAGE_LABELS = [
     "新建任务",
     "新聊天",
@@ -262,21 +262,12 @@
   }
 
   function findReferenceButton() {
-    const scroll = document.querySelector("[data-app-action-sidebar-scroll]");
-    if (!scroll) return null;
-    const buttons = Array.from(scroll.querySelectorAll("button"))
-      .filter((button) => button.getAttribute(OWNED_ATTRIBUTE) !== "true");
-    const plugin = buttons.find((button) => buttonMatches(button, PLUGIN_LABELS));
-    if (plugin?.parentElement) return plugin;
-
-    const firstSection = scroll.querySelector("[data-app-action-sidebar-section]");
-    if (!firstSection) return null;
-    const sectionTop = firstSection.getBoundingClientRect().top;
-    return buttons.filter((button) => {
-      const rect = button.getBoundingClientRect();
-      return rect.height > 0
-        && rect.bottom <= sectionTop;
-    }).at(-1) || null;
+    const rail = document.querySelector("nav[data-app-navigation-rail]");
+    if (!rail) return null;
+    return Array.from(rail.querySelectorAll("button")).find((button) => (
+      button.getAttribute(OWNED_ATTRIBUTE) !== "true"
+      && buttonMatches(button.querySelector(".sr-only"), EXPLORE_LABELS)
+    )) || null;
   }
 
   function replaceEntryIcon(button) {
@@ -299,14 +290,15 @@
     button.id = ENTRY_ID;
     button.type = "button";
     button.removeAttribute("disabled");
+    button.removeAttribute("aria-haspopup");
     button.removeAttribute("aria-expanded");
     button.removeAttribute("aria-controls");
     button.removeAttribute("aria-describedby");
     button.removeAttribute("data-state");
     button.setAttribute(OWNED_ATTRIBUTE, "true");
     button.querySelectorAll("[id]").forEach((node) => node.removeAttribute("id"));
-    entryLabel = button.querySelector(".text-fade-truncate")
-      || Array.from(button.querySelectorAll("span")).find((node) => buttonMatches(node, PLUGIN_LABELS));
+    button.querySelectorAll("span.absolute.end-0.top-0").forEach((node) => node.remove());
+    entryLabel = button.querySelector(".sr-only");
     syncEntryText(button);
     replaceEntryIcon(button);
     button.addEventListener("click", (event) => {
@@ -340,8 +332,8 @@
     const reference = findReferenceButton();
     if (!reference?.parentElement) return;
     if (!entry) entry = createEntry(reference);
-    if (entry.parentElement !== reference.parentElement || entry.previousElementSibling !== reference) {
-      reference.after(entry);
+    if (entry.parentElement !== reference.parentElement || entry.nextElementSibling !== reference) {
+      reference.before(entry);
     }
     syncEntryState();
   }
@@ -370,7 +362,7 @@
 
   function muteNativeSelection() {
     if (!active) return;
-    document.querySelectorAll('aside nav[role="navigation"] [aria-current]')
+    document.querySelectorAll('aside nav[role="navigation"] [aria-current], nav[data-app-navigation-rail] [aria-current]')
       .forEach((node) => {
         if (node === entry || node.closest(`#${ENTRY_ID}`)) return;
         if (!mutedNativeSelections.has(node)) {
@@ -1865,6 +1857,9 @@
 
     const clickable = target?.closest?.("button,a,[role='button'],[data-app-action-sidebar-thread-id]");
     if (!clickable || clickable === entry || clickable.closest(`#${ENTRY_ID}`)) return false;
+    if (clickable.closest("nav[data-app-navigation-rail]") && clickable.hasAttribute("data-sidebar-destination")) {
+      return true;
+    }
     if (!clickable.closest("aside nav[role='navigation']")) return false;
     if (clickable.hasAttribute("data-app-action-sidebar-section-toggle")) return false;
     if (buttonMatches(clickable, NATIVE_PAGE_LABELS)) return true;
